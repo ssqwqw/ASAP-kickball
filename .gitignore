@@ -48,6 +48,9 @@ wandb/
 __pycache__
 
 humanoidverse/data/motions
+# Exception: allow kickball directory
+!humanoidverse/data/motions/kickball/
+!humanoidverse/data/motions/kickball/*.pkl
 
 *.TXT
 
