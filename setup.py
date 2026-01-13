@@ -10,7 +10,7 @@ setup(
     python_requires=">=3.8",
     install_requires=[
         "hydra-core>=1.2.0",
-        "numpy==1.23.5",
+        "numpy>=1.26.0,<2.0",
         "rich",
         "ipdb",
         "matplotlib",

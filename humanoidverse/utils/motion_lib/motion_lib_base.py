@@ -38,8 +38,14 @@ class MotionlibMode(Enum):
 
 def to_torch(tensor):
     if torch.is_tensor(tensor):
+        # Ensure float32 if it's a float tensor
+        if tensor.dtype == torch.float64:
+            return tensor.float()
         return tensor
     else:
+        # Convert numpy array to float32 if it's float64
+        if isinstance(tensor, np.ndarray) and tensor.dtype == np.float64:
+            tensor = tensor.astype(np.float32)
         return torch.from_numpy(tensor)
 
 class MotionLibBase():
@@ -368,8 +374,60 @@ class MotionLibBase():
         for f in track(range(len(motion_data_list)), description="Loading motions..."):
             curr_file = motion_data_list[f]
             if not isinstance(curr_file, dict) and osp.isfile(curr_file):
+                loaded_data = joblib.load(curr_file)
+                # Check if the loaded data is a nested dict (key -> data) or direct data dict
                 key = motion_data_list[f].split("/")[-1].split(".")[0]
-                curr_file = joblib.load(curr_file)[key]
+                if isinstance(loaded_data, dict) and key in loaded_data:
+                    # Nested dict format: {'football5': {...}}
+                    curr_file = loaded_data[key]
+                elif isinstance(loaded_data, dict) and 'fps' in loaded_data:
+                    # Direct data dict format: {'fps': ..., 'root_pos': ..., ...}
+                    curr_file = loaded_data
+                else:
+                    # Fallback: try to use the key anyway
+                    curr_file = loaded_data[key]
+            
+            # Handle different data formats
+            # Format 1: Has root_trans_offset and pose_aa (standard format)
+            # Format 2: Has root_pos, root_rot, dof_pos (alternative format - needs conversion)
+            if 'root_trans_offset' not in curr_file and 'root_pos' in curr_file:
+                # Convert from alternative format to standard format
+                from scipy.spatial.transform import Rotation as sRot
+                # Ensure float32 dtype to match expected tensor types
+                root_pos = np.array(curr_file['root_pos'], dtype=np.float32)
+                root_rot = np.array(curr_file['root_rot'], dtype=np.float32)  # quaternion format (T, 4)
+                dof_pos = np.array(curr_file['dof_pos'], dtype=np.float32)  # (T, num_dof)
+                
+                # Convert root_rot from quaternion to rotation vector
+                if root_rot.shape[-1] == 4:
+                    # quaternion format - assume xyzw
+                    root_rot_vec = sRot.from_quat(root_rot).as_rotvec().astype(np.float32)  # (T, 3)
+                else:
+                    root_rot_vec = root_rot.astype(np.float32)
+                
+                # Build pose_aa structure: [root_rot (1, 3), dof_joints (num_dof, 3), augment_joints (num_augment_joint, 3)]
+                # For dof joints, we need to convert dof_pos (angles) to rotation vectors
+                # Since we don't have dof_axis at this point, we'll create zeros and let mesh_parsers handle it
+                # But we need the correct number of joints
+                num_dof = dof_pos.shape[-1]
+                num_augment_joint = getattr(self, 'num_augment_joint', 0)
+                num_total_joints = 1 + num_dof + num_augment_joint  # root + dof + augment
+                
+                # Create pose_aa: initialize with zeros, set root rotation (ensure float32)
+                pose_aa = np.zeros((root_pos.shape[0], num_total_joints, 3), dtype=np.float32)
+                pose_aa[:, 0, :] = root_rot_vec  # root rotation (T, 3)
+                # dof joints will be set to zero for now - mesh_parsers will handle conversion
+                # Note: This is a temporary solution. The proper conversion requires dof_axis
+                # which is available in mesh_parsers, but we need pose_aa structure here
+                
+                # root_trans_offset is same as root_pos for this format (ensure float32)
+                root_trans_offset = root_pos.copy().astype(np.float32)
+                
+                # Store original dof_pos for later use if needed
+                curr_file = curr_file.copy()
+                curr_file['root_trans_offset'] = root_trans_offset
+                curr_file['pose_aa'] = pose_aa
+                curr_file['_original_dof_pos'] = dof_pos  # Store for potential later use
 
             seq_len = curr_file['root_trans_offset'].shape[0]
             if max_len == -1 or seq_len < max_len:
@@ -380,6 +438,11 @@ class MotionLibBase():
 
             trans = to_torch(curr_file['root_trans_offset']).clone()[start:end]
             pose_aa = to_torch(curr_file['pose_aa'][start:end]).clone()
+            # Ensure float32 dtype to avoid type mismatch errors
+            if trans.dtype == torch.float64:
+                trans = trans.float()
+            if pose_aa.dtype == torch.float64:
+                pose_aa = pose_aa.float()
             # import ipdb; ipdb.set_trace()
             if "action" in curr_file.keys():
                 self.has_action = True

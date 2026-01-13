@@ -52,6 +52,9 @@ def listen_for_keypress(env):
 
 @hydra.main(config_path="config", config_name="base_eval")
 def main(override_config: OmegaConf):
+    # Declare sys as global to avoid UnboundLocalError when sys.argv is modified later
+    global sys
+    
     # logging to hydra log file
     hydra_log_path = os.path.join(HydraConfig.get().runtime.output_dir, "eval.log")
     logger.remove()
@@ -105,7 +108,17 @@ def main(override_config: OmegaConf):
             
     simulator_type = config.simulator['_target_'].split('.')[-1]
     if simulator_type == 'IsaacSim':
-        from omni.isaac.lab.app import AppLauncher
+        # Ensure numpy is imported and available before starting Isaac Sim
+        import numpy
+        # Force import numpy._core to ensure it's available
+        try:
+            import numpy._core
+        except ImportError:
+            # If _core is not available, try to reinstall/upgrade numpy
+            logger.error("numpy._core not available. Please ensure numpy >= 1.26.1 is installed.")
+            sys.exit(1)
+        
+        from isaaclab.app import AppLauncher
         import argparse
         parser = argparse.ArgumentParser(description="Evaluate an RL agent with RSL-RL.")
         AppLauncher.add_app_launcher_args(parser)
@@ -123,7 +136,19 @@ def main(override_config: OmegaConf):
         simulation_app = app_launcher.app
     if simulator_type == 'IsaacGym':
         import isaacgym
-        
+    
+    # Ensure numpy._core is available before importing modules that depend on it
+    import numpy
+    try:
+        import numpy._core
+    except ImportError:
+        logger.error("numpy._core not available. Please ensure numpy >= 1.26.1 is installed.")
+        sys.exit(1)
+    
+    # Pre-import scipy to ensure it can find numpy._core
+    import scipy
+    from scipy.spatial.transform import Rotation
+    
     from humanoidverse.agents.base_algo.base_algo import BaseAlgo  # noqa: E402
     from humanoidverse.utils.helpers import pre_process_config
     import torch
@@ -184,6 +209,14 @@ def main(override_config: OmegaConf):
         logger.info(f'Exported policy as onnx to: {os.path.join(exported_policy_path, exported_onnx_name)}')
 
     algo.evaluate_policy()
+
+    logger.info("Evaluation completed. Closing simulation...")
+    if simulator_type == 'IsaacSim':
+        simulation_app.close()
+        logger.info("Simulation closed. Exiting...")
+    
+    # Explicitly exit to ensure program terminates
+    sys.exit(0)
 
 
 if __name__ == "__main__":

@@ -19,11 +19,24 @@ from utils.config_utils import *  # noqa: E402, F403
 
 @hydra.main(config_path="config", config_name="base", version_base="1.1")
 def main(config: OmegaConf):
+    # Declare sys as global to avoid UnboundLocalError when sys.argv is modified later
+    global sys
+    
     # import ipdb; ipdb.set_trace()
     simulator_type = config.simulator['_target_'].split('.')[-1]
     # import ipdb; ipdb.set_trace()
     if simulator_type == 'IsaacSim':
-        from omni.isaac.lab.app import AppLauncher
+        # Ensure numpy is imported and available before starting Isaac Sim
+        import numpy
+        # Force import numpy._core to ensure it's available
+        try:
+            import numpy._core
+        except ImportError:
+            # If _core is not available, try to reinstall/upgrade numpy
+            logger.error("numpy._core not available. Please ensure numpy >= 1.26.1 is installed.")
+            sys.exit(1)
+        
+        from isaaclab.app import AppLauncher
         import argparse
         parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
         AppLauncher.add_app_launcher_args(parser)
@@ -46,6 +59,19 @@ def main(config: OmegaConf):
 
     # have to import torch after isaacgym
     import torch  # noqa: E402
+    
+    # Ensure numpy._core is available before importing modules that depend on it
+    import numpy
+    try:
+        import numpy._core
+    except ImportError:
+        logger.error("numpy._core not available. Please ensure numpy >= 1.26.1 is installed.")
+        sys.exit(1)
+    
+    # Pre-import scipy to ensure it can find numpy._core
+    import scipy
+    from scipy.spatial.transform import Rotation
+    
     from utils.common import seeding
     import wandb
     from humanoidverse.envs.base_task.base_task import BaseTask  # noqa: E402
@@ -126,8 +152,13 @@ def main(config: OmegaConf):
     # handle saving config
     algo.learn()
 
+    logger.info("Training completed. Closing simulation...")
     if simulator_type == 'IsaacSim':
         simulation_app.close()
+        logger.info("Simulation closed. Exiting...")
+    
+    # Explicitly exit to ensure program terminates
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()

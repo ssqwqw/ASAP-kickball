@@ -242,6 +242,8 @@ class Humanoid_Batch:
         rotations_world = []
 
         expanded_offsets = (self._offsets[:, None].expand(B, seq_len, J, 3).to(device).type(dtype))
+        # Ensure _local_rotation_mat has the same dtype
+        local_rotation_mat = self._local_rotation_mat.to(device).type(dtype)
         # print(expanded_offsets.shape, J)
 
         # import ipdb; ipdb.set_trace()   
@@ -252,7 +254,7 @@ class Humanoid_Batch:
             else:
                 try:
                     jpos = (torch.matmul(rotations_world[self._parents[i]][:, :, 0], expanded_offsets[:, :, i, :, None]).squeeze(-1) + positions_world[self._parents[i]])
-                    rot_mat = torch.matmul(rotations_world[self._parents[i]], torch.matmul(self._local_rotation_mat[:,  (i):(i + 1)], rotations[:, :, (i - 1):i, :]))
+                    rot_mat = torch.matmul(rotations_world[self._parents[i]], torch.matmul(local_rotation_mat[:,  (i):(i + 1)], rotations[:, :, (i - 1):i, :]))
                 except Exception as e:
                     logger.error(f"Error at joint index {i}")
                     logger.error(f"Parent index: {self._parents[i]}")
