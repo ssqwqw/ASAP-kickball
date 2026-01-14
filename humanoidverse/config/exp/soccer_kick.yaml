@@ -1,0 +1,8 @@
+# @package _global_
+
+defaults:
+  - /algo: ppo
+  - /env: soccer_kick
+  - /rewards: rewards/motion_tracking/reward_soccer_kick
+
+experiment_name: SoccerKick_G1_Training

@@ -152,9 +152,32 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         self.motion_start_times = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device, requires_grad=False)
         self.motion_len = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device, requires_grad=False)
         
+        # Soccer ball related buffers
+        self.ball_init_pos = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
+        self.ball_target_pos = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
+        self.ball_initial_distance = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.ball_kicked = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        
+        # Track ball speed for contact reward
+        self.ball_speed_prev = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.ball_speed_change = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        
     def _init_domain_rand_buffers(self):
         super()._init_domain_rand_buffers()
         self.ref_episodic_offset = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
+        
+        # Initialize soccer ball parameters
+        if hasattr(self.config, 'soccer_ball'):
+            self.ball_distance_range = self.config.soccer_ball.get('ball_distance_range', [0.8, 1.2])
+            self.ball_lateral_range = self.config.soccer_ball.get('ball_lateral_range', [-0.2, 0.2])
+            self.target_distance = self.config.soccer_ball.get('target_distance', 5.0)
+            self.kick_velocity_threshold = self.config.soccer_ball.get('kick_velocity_threshold', 2.0)
+        else:
+            # Default values if not specified in config
+            self.ball_distance_range = [0.8, 1.2]
+            self.ball_lateral_range = [-0.2, 0.2]
+            self.target_distance = 5.0
+            self.kick_velocity_threshold = 2.0
 
     def _reset_tasks_callback(self, env_ids):
         if len(env_ids) == 0:
@@ -164,6 +187,9 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         self._resample_motion_times(env_ids) # need to resample before reset root states
         if self.config.termination.terminate_when_motion_far and self.config.termination_curriculum.terminate_when_motion_far_curriculum:
             self._update_terminate_when_motion_far_curriculum()
+        
+        # Reset ball states
+        self._reset_ball_states(env_ids)
     
     def _update_terminate_when_motion_far_curriculum(self):
         assert self.config.termination.terminate_when_motion_far and self.config.termination_curriculum.terminate_when_motion_far_curriculum
@@ -227,6 +253,47 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         self._motion_lib.load_motions(random_sample=True)
         self.reset_envs_idx(torch.arange(self.num_envs, device=self.device))
 
+
+    def _reset_ball_states(self, env_ids):
+        """Reset ball position and velocity for specified environments"""
+        if len(env_ids) == 0:
+            return
+        
+        # Get robot root position for each environment
+        robot_pos = self.simulator.robot_root_states[env_ids, :3].clone()
+        
+        # Randomize ball position in front of robot
+        ball_distance = torch.rand(len(env_ids), device=self.device) * (self.ball_distance_range[1] - self.ball_distance_range[0]) + self.ball_distance_range[0]
+        ball_lateral = torch.rand(len(env_ids), device=self.device) * (self.ball_lateral_range[1] - self.ball_lateral_range[0]) + self.ball_lateral_range[0]
+        
+        # Calculate ball position relative to robot (in front)
+        ball_offset = torch.zeros(len(env_ids), 3, device=self.device)
+        ball_offset[:, 0] = ball_distance  # Forward
+        ball_offset[:, 1] = ball_lateral   # Lateral
+        ball_offset[:, 2] = 0.11  # Ball radius above ground
+        
+        self.ball_init_pos[env_ids] = robot_pos + ball_offset
+        
+        # Set target position (goal) - further ahead
+        self.ball_target_pos[env_ids] = robot_pos.clone()
+        self.ball_target_pos[env_ids, 0] += self.target_distance
+        self.ball_target_pos[env_ids, 2] = 0.11  # Keep at ball height
+        
+        # Calculate initial distance from ball to target
+        self.ball_initial_distance[env_ids] = torch.norm(self.ball_target_pos[env_ids] - self.ball_init_pos[env_ids], dim=-1)
+        
+        # Reset ball kicked flag
+        self.ball_kicked[env_ids] = False
+        
+        # Create ball state tensor (pos, rot, lin_vel, ang_vel)
+        ball_states = torch.zeros(self.num_envs, 13, device=self.device)
+        ball_states[env_ids, :3] = self.ball_init_pos[env_ids]
+        ball_states[env_ids, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)  # wxyz quaternion
+        ball_states[env_ids, 7:] = 0.0  # Zero velocities
+        
+        # Set ball state in simulator
+        if hasattr(self.simulator, 'set_ball_state_tensor'):
+            self.simulator.set_ball_state_tensor(env_ids, ball_states)
 
     def _pre_compute_observations_callback(self):
         super()._pre_compute_observations_callback()
@@ -344,6 +411,30 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         self._ref_motion_phase = self._ref_motion_phase.unsqueeze(1)
         # print(f"ref_motion_phase: {self._ref_motion_phase[0].item():.2f}")
         # print(f"ref_motion_length: {self._ref_motion_length[0].item():.2f}")
+        
+        # Update ball-related observations
+        if hasattr(self.simulator, 'ball_pos'):
+            self.ball_pos_global = self.simulator.ball_pos.clone()
+            self.ball_vel_global = self.simulator.ball_lin_vel.clone()
+            
+            # Compute ball position relative to robot base (in robot frame)
+            ball_to_robot = self.ball_pos_global - self.simulator.robot_root_states[:, :3]
+            heading_inv_rot = calc_heading_quat_inv(self.simulator.robot_root_states[:, 3:7].clone(), w_last=True)
+            self._obs_ball_pos_robot_frame = my_quat_rotate(heading_inv_rot, ball_to_robot)
+            
+            # Compute ball velocity in robot frame
+            self._obs_ball_vel_robot_frame = my_quat_rotate(heading_inv_rot, self.ball_vel_global)
+            
+            # Compute ball to target distance
+            self.ball_to_target_distance = torch.norm(self.ball_pos_global - self.ball_target_pos, dim=-1)
+            
+            # Track ball speed and speed change for contact reward
+            ball_speed = torch.norm(self.ball_vel_global, dim=-1)
+            self.ball_speed_change = ball_speed - self.ball_speed_prev
+            self.ball_speed_prev = ball_speed.clone()
+            
+            # Check if ball is kicked (velocity above threshold)
+            self.ball_kicked |= (ball_speed > self.kick_velocity_threshold)
         
         self._log_motion_tracking_info()
 
@@ -555,6 +646,20 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
     
     def _get_obs_vr_3point_pos(self):
         return self._obs_vr_3point_pos
+    
+    def _get_obs_ball_pos_robot_frame(self):
+        """Get ball position in robot frame"""
+        if hasattr(self, '_obs_ball_pos_robot_frame'):
+            return self._obs_ball_pos_robot_frame
+        else:
+            return torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device)
+    
+    def _get_obs_ball_vel_robot_frame(self):
+        """Get ball velocity in robot frame"""
+        if hasattr(self, '_obs_ball_vel_robot_frame'):
+            return self._obs_ball_vel_robot_frame
+        else:
+            return torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device)
 
     ######################### Observations #########################
     def _get_obs_history_actor(self,):
@@ -637,6 +742,141 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         diff_joint_vel_dist = (joint_vel_diff**2).mean(dim=-1)
         r_joint_vel = torch.exp(-diff_joint_vel_dist / self.config.rewards.reward_tracking_sigma.teleop_joint_vel)
         return r_joint_vel
+    
+    ######################### Soccer Kick Rewards #########################
+    def _reward_kick_ball_to_target(self):
+        """Reward for kicking the ball towards the target (goal)"""
+        if not hasattr(self.simulator, 'ball_pos'):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        
+        # Reward based on reduction of ball-to-target distance
+        distance_reduction = self.ball_initial_distance - self.ball_to_target_distance
+        distance_reduction_normalized = distance_reduction / self.ball_initial_distance
+        
+        # Only give reward if ball has been kicked
+        reward = torch.where(
+            self.ball_kicked,
+            torch.clamp(distance_reduction_normalized, 0.0, 1.0),
+            torch.zeros_like(distance_reduction_normalized)
+        )
+        
+        return reward
+    
+    def _reward_kick_ball_velocity(self):
+        """Reward for imparting velocity to the ball in the right direction"""
+        if not hasattr(self.simulator, 'ball_pos'):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        
+        # Direction from ball to target
+        ball_to_target = self.ball_target_pos - self.ball_pos_global
+        ball_to_target_normalized = ball_to_target / (torch.norm(ball_to_target, dim=-1, keepdim=True) + 1e-8)
+        
+        # Ball velocity component towards target
+        ball_speed = torch.norm(self.ball_vel_global, dim=-1)
+        ball_vel_normalized = self.ball_vel_global / (ball_speed.unsqueeze(-1) + 1e-8)
+        
+        # Cosine similarity between ball velocity and target direction
+        velocity_alignment = torch.sum(ball_vel_normalized * ball_to_target_normalized, dim=-1)
+        
+        # Reward is speed * alignment (only positive alignment)
+        reward = ball_speed * torch.clamp(velocity_alignment, 0.0, 1.0)
+        reward = torch.clamp(reward / 10.0, 0.0, 1.0)  # Normalize to [0, 1]
+        
+        return reward
+    
+    def _reward_approach_ball(self):
+        """Reward for approaching the ball (before kicking)
+        
+        改进点:
+        1. 只在球未被踢出时给奖励
+        2. 当距离小于10cm时停止奖励,避免"贴着球站着不踢"
+        3. 鼓励接近但不鼓励过度贴近
+        """
+        if not hasattr(self.simulator, 'ball_pos'):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        
+        # Get feet positions (assume last two bodies are feet)
+        feet_indices = self.feet_indices if hasattr(self, 'feet_indices') else [-2, -1]
+        feet_pos = self._rigid_body_pos[:, feet_indices, :]
+        
+        # Distance from closest foot to ball
+        feet_to_ball = self.ball_pos_global.unsqueeze(1) - feet_pos
+        feet_to_ball_dist = torch.norm(feet_to_ball, dim=-1)
+        min_foot_to_ball_dist = torch.min(feet_to_ball_dist, dim=-1)[0]
+        
+        # Exponential reward for getting close to ball
+        reward = torch.exp(-min_foot_to_ball_dist / 0.3)
+        
+        # 改进1: 只在球未被踢出时给奖励
+        reward = reward * (~self.ball_kicked).float()
+        
+        # 改进2: 当距离小于10cm时停止奖励,避免"贴着球站着不踢"
+        # 这个距离是合理的踢球准备距离
+        reward = reward * (min_foot_to_ball_dist > 0.1).float()
+        
+        return reward
+    
+    def _reward_ball_contact(self):
+        """Reward for making contact with the ball
+        
+        改进点:
+        1. 不再是简单的二值奖励(接触=1)
+        2. 奖励与球速变化(冲量)成正比
+        3. 鼓励"有效踢球"而非"轻轻触碰"
+        4. 结合接触检测和速度变化,避免误判
+        """
+        if not hasattr(self.simulator, 'ball_pos'):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        
+        # Get feet positions
+        feet_indices = self.feet_indices if hasattr(self, 'feet_indices') else [-2, -1]
+        feet_pos = self._rigid_body_pos[:, feet_indices, :]
+        
+        # Check if any foot is very close to ball (contact detection)
+        feet_to_ball = self.ball_pos_global.unsqueeze(1) - feet_pos
+        feet_to_ball_dist = torch.norm(feet_to_ball, dim=-1)
+        min_dist = torch.min(feet_to_ball_dist, dim=-1)[0]
+        
+        # Contact threshold (ball radius + small margin)
+        contact_threshold = 0.15  # 11cm ball radius + 4cm margin
+        is_contact = (min_dist < contact_threshold).float()
+        
+        # 改进: 基于球速变化的奖励(只在接触时计算)
+        # ball_speed_change > 0 表示球被加速了
+        speed_change_reward = torch.clamp(self.ball_speed_change / 5.0, 0.0, 1.0)  # 归一化到[0,1]
+        
+        # 最终奖励 = 接触检测 × 速度变化奖励
+        # 这样既要接触,又要有效用力
+        reward = is_contact * speed_change_reward
+        
+        # 备选: 如果速度变化很小,至少给一点基础接触奖励(可选)
+        # 这可以帮助初期学习
+        base_contact_reward = 0.1 * is_contact
+        reward = torch.max(reward, base_contact_reward)
+        
+        return reward
+    
+    def _reward_kick_ball_height(self):
+        """Penalize ball going too high (want ground kick for soccer)"""
+        if not hasattr(self.simulator, 'ball_pos'):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        
+        # Penalize if ball is too high above ground
+        ball_height = self.ball_pos_global[:, 2]
+        max_desired_height = 0.5  # 50cm
+        
+        # Penalty for excessive height
+        height_excess = torch.clamp(ball_height - max_desired_height, 0.0, float('inf'))
+        penalty = -height_excess / 1.0  # Normalize penalty
+        
+        # Only apply penalty if ball has been kicked
+        penalty = torch.where(
+            self.ball_kicked,
+            penalty,
+            torch.zeros_like(penalty)
+        )
+        
+        return penalty
     
     def setup_visualize_entities(self):
         if self.debug_viz and self.config.simulator.config.name == "genesis":

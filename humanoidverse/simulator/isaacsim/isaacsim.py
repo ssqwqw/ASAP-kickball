@@ -12,11 +12,11 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.scene import InteractiveScene
 from isaaclab.utils.timer import Timer
 
-from isaaclab.assets import Articulation
+from isaaclab.assets import Articulation, RigidObject
 from isaaclab.sensors import ContactSensor, RayCaster
 from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
 from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
-from isaaclab.assets import ArticulationCfg
+from isaaclab.assets import ArticulationCfg, RigidObjectCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG
 from isaaclab.terrains import TerrainGeneratorCfg
@@ -471,6 +471,40 @@ class IsaacSim(BaseSimulator):
         self._height_scanner = RayCaster(height_scanner_config)
         self.scene.sensors["height_scanner"] = self._height_scanner
 
+        # Add soccer ball
+        ball_radius = 0.11  # Standard soccer ball radius (22cm diameter)
+        ball_mass = 0.45  # Standard soccer ball mass (450g)
+        ball_config = RigidObjectCfg(
+            prim_path="/World/envs/env_.*/Ball",
+            spawn=sim_utils.SphereCfg(
+                radius=ball_radius,
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                    disable_gravity=False,
+                    max_linear_velocity=1000.0,
+                    max_angular_velocity=1000.0,
+                    max_depenetration_velocity=1.0,
+                ),
+                mass_props=sim_utils.MassPropertiesCfg(mass=ball_mass),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                physics_material=sim_utils.RigidBodyMaterialCfg(
+                    static_friction=0.6,
+                    dynamic_friction=0.6,
+                    restitution=0.7,  # Ball bounce factor
+                ),
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(1.0, 1.0, 1.0),
+                    metallic=0.0,
+                ),
+            ),
+            init_state=RigidObjectCfg.InitialStateCfg(
+                pos=(1.0, 0.0, ball_radius),  # Position ball in front of robot
+                rot=(1.0, 0.0, 0.0, 0.0),  # No rotation (w, x, y, z)
+                lin_vel=(0.0, 0.0, 0.0),
+                ang_vel=(0.0, 0.0, 0.0),
+            ),
+        )
+        self._ball = RigidObject(ball_config)
+        self.scene.rigid_objects["ball"] = self._ball
         
         
         self.terrain = terrain_config.class_type(terrain_config)
@@ -676,6 +710,13 @@ class IsaacSim(BaseSimulator):
         self._rigid_body_vel = self._robot.data.body_lin_vel_w[:, self.body_ids, :]
         self._rigid_body_ang_vel = self._robot.data.body_ang_vel_w[:, self.body_ids, :]
 
+        # Update ball states
+        self.ball_root_states = self._ball.data.root_state_w  # (num_envs, 13)
+        self.ball_pos = self.ball_root_states[:, :3]  # (num_envs, 3)
+        self.ball_rot = self.ball_root_states[:, [4, 5, 6, 3]]  # (num_envs, 4) wxyz to xyzw
+        self.ball_lin_vel = self.ball_root_states[:, 7:10]  # (num_envs, 3)
+        self.ball_ang_vel = self.ball_root_states[:, 10:13]  # (num_envs, 3)
+
     def apply_torques_at_dof(self, torques):
         self._robot.set_joint_effort_target(torques, joint_ids=self.dof_ids)
     
@@ -686,6 +727,13 @@ class IsaacSim(BaseSimulator):
     def set_dof_state_tensor(self, set_env_ids, dof_states):
         dof_pos, dof_vel = dof_states[set_env_ids, :, 0], dof_states[set_env_ids, :, 1]
         self._robot.write_joint_state_to_sim(dof_pos, dof_vel, self.dof_ids, set_env_ids)
+    
+    def set_ball_state_tensor(self, set_env_ids, ball_states):
+        """Set ball position, rotation, and velocities
+        ball_states: (num_envs, 13) [pos(3), rot_wxyz(4), lin_vel(3), ang_vel(3)]
+        """
+        self._ball.write_root_pose_to_sim(ball_states[set_env_ids, :7], set_env_ids)
+        self._ball.write_root_velocity_to_sim(ball_states[set_env_ids, 7:], set_env_ids)
     
     def simulate_at_each_physics_step(self):
         self._sim_step_counter += 1
